@@ -17,6 +17,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -339,6 +340,8 @@ internal class MeshEngine(
             for (frame in outbound) {
                 try {
                     transport.send(frame)
+                } catch (e: ClosedSendChannelException) {
+                    logger.error(TAG, e) { "Transport send failed, channel closed: ${e.message}" }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -353,8 +356,12 @@ internal class MeshEngine(
         }
 
         scope.launch(CoroutineName("meshtastic-transport-observer")) {
-            transport.state.collect { state ->
-                inbox.send(EngineMessage.TransportStateChanged(state))
+            try {
+                transport.state.collect { state ->
+                    inbox.send(EngineMessage.TransportStateChanged(state))
+                }
+            } catch (e: ClosedSendChannelException) {
+                logger.error(TAG, e) { "Transport send failed, channel closed: ${e.message}" }
             }
         }
 

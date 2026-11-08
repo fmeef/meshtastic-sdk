@@ -16,7 +16,7 @@ kotlin {
 
     sourceSets {
         commonMain.dependencies {
-            api(libs.meshtasticProtobufs)
+            api(project(":kmp"))
             api(libs.coroutinesCore)
             implementation(libs.atomicfu)
             api(libs.okio)

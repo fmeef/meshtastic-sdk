@@ -28,6 +28,8 @@ dependencyResolutionManagement {
     }
 }
 
+includeBuild("protobufs/packages/kmp")
+
 rootProject.name = "meshtastic-sdk"
 
 // Phase 1 bootstrap: keep focused module set while enabling convention plugins.

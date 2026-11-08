@@ -1638,7 +1638,6 @@ internal class MeshEngine(
                     ),
                 ),
             )
-            return
         }
         emitPacketOrLog(packet)
         // Decode the admin payload once; both the passkey latch and external-change detection

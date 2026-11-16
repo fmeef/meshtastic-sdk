@@ -163,12 +163,20 @@ internal class MeshEngine(
     private var handshakeStage = HandshakeStage.Idle
     private var engineScope: CoroutineScope? = null
 
-    // Inter-stage and periodic keep-alive heartbeats are sent with nonce = 0. Firmware
-    // (PhoneAPI.cpp:202-209) interprets nonce == 1 as "broadcast our nodeinfo over LoRa";
-    // nonces > 0 are reserved for explicit "ping our nodeinfo" semantics that we don't
-    // expose today. Sending 0 is the safe keep-alive value and matches Android's reference
-    // client.
-    private val keepaliveHeartbeat = Heartbeat.Builder().also { wb -> wb.nonce = 0 }.build()
+    // Inter-stage and periodic keep-alive heartbeats are sent with rotating nonces
+    // Firmware (PhoneAPI.cpp:202-209) interprets nonce == 1 as "broadcast our
+    // nodeinfo over LoRa"; nonces > 0 are reserved for explicit "ping our nodeinfo"
+    // semantics that we don't expose today. Sending 0 is the safe keep-alive
+    // value and matches Android's reference. client.
+    private var heartbeatNonce: Int = 1
+
+    private fun nextKeepaliveHeartbeat(): Heartbeat {
+        heartbeatNonce += 1
+        if (heartbeatNonce == 0 || heartbeatNonce == 1) heartbeatNonce = 2
+        val nonce = heartbeatNonce
+        return Heartbeat.Builder().also { wb -> wb.nonce = nonce }.build()
+    }
+
     private var myNodeNum = 0
 
     // R-9: snapshot of the previously-persisted my_node_num, captured at connect time so
@@ -1131,9 +1139,10 @@ internal class MeshEngine(
             handshakeStage = HandshakeStage.Stage1Settling
         }
 
-        // keep-alive heartbeats use nonce=0 (see [keepaliveHeartbeat] for rationale).
-        sendToRadio(ToRadio.Builder().also { wb -> wb.heartbeat = keepaliveHeartbeat }.build())
-        logger.debug(TAG) { "Sent inter-stage heartbeat nonce=0" }
+        // keep-alive heartbeats use rotating nonce (see [keepaliveHeartbeat] for rationale).
+        val hb = nextKeepaliveHeartbeat()
+        sendToRadio(ToRadio.Builder().also { wb -> wb.heartbeat = hb }.build())
+        logger.debug(TAG) { "Sent inter-stage heartbeat nonce=${hb.nonce}" }
         engineScope?.launch {
             delay(INTER_STAGE_SETTLE_MS)
             inbox.trySend(EngineMessage.HandshakeHeartbeatSettleComplete)
@@ -2288,9 +2297,10 @@ internal class MeshEngine(
     private fun handleHeartbeatTick() {
         if (handshakeStage != HandshakeStage.Ready) return
         if (!bleHeartbeatEnabled && transport.identity.raw.startsWith("ble:")) return
-        // keep-alive heartbeats use nonce=0 (see [keepaliveHeartbeat] for rationale).
-        sendToRadio(ToRadio.Builder().also { wb -> wb.heartbeat = keepaliveHeartbeat }.build())
-        logger.verbose(TAG) { "Heartbeat sent nonce=0" }
+        // keep-alive heartbeats use rotating nonce (see [keepaliveHeartbeat] for rationale).
+        val hb = nextKeepaliveHeartbeat()
+        sendToRadio(ToRadio.Builder().also { wb -> wb.heartbeat = hb }.build())
+        logger.verbose(TAG) { "Heartbeat sent nonce=${hb.nonce}" }
         // piggy-back heartbeat persistence on the 30 s heartbeat tick so we write at most
         // a bounded number of rows per session tick, even on busy meshes.
         flushDirtyHeartbeats()

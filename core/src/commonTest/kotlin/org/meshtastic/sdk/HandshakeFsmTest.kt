@@ -265,23 +265,33 @@ class HandshakeFsmTest {
      * "broadcast our nodeinfo over LoRa". Keep-alive heartbeats — both inter-stage and the
      * periodic 30 s tick — MUST use nonce=0 so the SDK never silently spams a NodeInfo
      * broadcast onto the mesh.
+     *
+     * In order to pass a check for identical nonce by the api/v1/toradio method in
+     * firmware api. Without sending a different nonce each time the radio drops
+     * our writes
      */
     @Test
-    fun keepaliveHeartbeatsUseNonceZero() = runTest {
+    fun keepaliveHeartbeatsUseDistinctNonReservedNonces() = runTest {
         val transport = FakeRadioTransport(TransportIdentity("fake:heartbeat-nonce"), autoHandshake = true)
         val client = buildClient(transport)
         client.connect()
+        advanceTimeBy(95_000)
 
         val heartbeatNonces = transport.outboundFrames()
             .mapNotNull { decodeToRadioOrNull(it) }
             .mapNotNull { it.heartbeat }
             .map { it.nonce }
 
-        assertTrue(heartbeatNonces.isNotEmpty(), "Expected at least one heartbeat to be sent")
+        assertTrue(heartbeatNonces.size >= 2, "Expected inter-stage + periodic heartbeats; got: $heartbeatNonces")
         assertTrue(
-            heartbeatNonces.all { it == 0 },
-            "Every keep-alive heartbeat nonce must be 0 (firmware overloads non-zero values; nonce=1 triggers a LoRa NodeInfo broadcast); got: $heartbeatNonces",
+            heartbeatNonces.none { it == 0 || it == 1 },
+            "Heartbeat nonces must skip 0 and the reserved NodeInfo trigger 1; got: $heartbeatNonces",
         )
+        assertTrue(
+            heartbeatNonces.zipWithNext().all { (a, b) -> a != b },
+            "Consecutive heartbeat nonces must differ (firmware drops duplicate BLE writes); got: $heartbeatNonces",
+        )
+        client.disconnect()
     }
 
     /**

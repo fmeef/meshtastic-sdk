@@ -234,6 +234,12 @@ internal class MeshEngine(
      */
     private var livenessBudgetMs: Long = 0L
     private var livenessWatchdogJob: Job? = null
+
+    // Periodic heartbeat / presence tickers, launched on each transition to Ready. Tracked so
+    // an auto-reconnect cycle cancels them; otherwise every reconnect stacks another ticker
+    // (engineScope survives reconnect) and heartbeats go out N times per interval.
+    private var heartbeatTickerJob: Job? = null
+    private var presenceTickerJob: Job? = null
     private var disconnecting = false
 
     /**
@@ -871,6 +877,33 @@ internal class MeshEngine(
     }
 
     private fun handleDisconnect(msg: EngineMessage.Disconnect) {
+        // Error-triggered disconnects (outbound write failure, frame reader failure, liveness
+        // timeout) are recoverable: per the [EngineMessage.Disconnect] contract they go through
+        // auto-reconnect instead of tearing the session down. Without this a single transient
+        // BLE write rejection (e.g. WriteRequestBusy) permanently killed the client even with
+        // autoReconnect enabled.
+        val cause = msg.cause
+        if (cause != null && !disconnecting && autoReconnectConfig.enabled &&
+            cause !is MeshtasticException.FirmwareTooOld &&
+            (handshakeStage == HandshakeStage.Ready || autoReconnectInProgress)
+        ) {
+            if (autoReconnectInProgress) {
+                // A reconnect cycle is already scheduled or running; follow-on failures from
+                // the dying link (queued writes, the reader) must not stack extra attempts.
+                logger.verbose(TAG) { "Ignoring transport failure during reconnect: ${cause.message}" }
+                return
+            }
+            logger.warn(TAG, cause) { "Transport failure (${cause.message}); scheduling auto-reconnect" }
+            val transportError = cause as? MeshtasticException.Transport ?: MeshtasticException.tag(
+                MeshtasticException.Transport(cause.message ?: "transport failure", cause),
+                transportIdentity = transport.identity,
+                operation = "engine.transportFailure",
+            )
+            events.tryEmit(MeshEvent.TransportError(transportError))
+            scheduleReconnect(transportError)
+            return
+        }
+
         // mark `disconnecting` so the liveness watchdog can't re-emit a TransportError
         // while we're already tearing down.
         disconnecting = true
@@ -1472,7 +1505,8 @@ internal class MeshEngine(
         connectionState.value = ConnectionState.Connected
 
         // Start the 30 s periodic heartbeat scheduler.
-        engineScope?.launch {
+        heartbeatTickerJob?.cancel()
+        heartbeatTickerJob = engineScope?.launch {
             while (true) {
                 delay(HEARTBEAT_INTERVAL_MS)
                 inbox.trySend(EngineMessage.HeartbeatTick)
@@ -1495,8 +1529,10 @@ internal class MeshEngine(
         }
 
         // Presence check: scan nodes for offline transitions every 30s (piggybacks on heartbeat interval).
+        presenceTickerJob?.cancel()
+        presenceTickerJob = null
         if (presenceTimeout.isPositive() && presenceTimeout.isFinite()) {
-            engineScope?.launch {
+            presenceTickerJob = engineScope?.launch {
                 while (true) {
                     delay(HEARTBEAT_INTERVAL_MS)
                     inbox.trySend(EngineMessage.PresenceCheckTick)
@@ -2114,6 +2150,10 @@ internal class MeshEngine(
         recentInboundPacketKeySet.clear()
         livenessWatchdogJob?.cancel()
         livenessWatchdogJob = null
+        heartbeatTickerJob?.cancel()
+        heartbeatTickerJob = null
+        presenceTickerJob?.cancel()
+        presenceTickerJob = null
 
         // Fail in-flight sends — their wire IDs won't survive the device-side session restart.
         for ((_, stateFlow) in pendingSends) {

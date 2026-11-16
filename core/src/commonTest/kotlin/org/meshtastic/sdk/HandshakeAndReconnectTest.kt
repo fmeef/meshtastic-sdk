@@ -783,6 +783,51 @@ class HandshakeAndReconnectTest {
         assertEquals(ConnectionState.Disconnected, client.connection.value)
     }
 
+    /**
+     * A single failed outbound write after Ready (observed on Android as BLE
+     * `WriteRequestBusy`) must route through auto-reconnect rather than the user-disconnect
+     * teardown, and the reconnected session must not stack a second heartbeat ticker.
+     */
+    @Test
+    fun outboundWriteFailureAfterReadyTriggersAutoReconnect() = runTest {
+        val transport = ScriptedTransport(
+            identity = TransportIdentity("fake:write-failure-reconnect"),
+            nowMs = { currentTime },
+        )
+        val client = buildClient(
+            transport = transport,
+            autoReconnect = AutoReconnectConfig(
+                enabled = true,
+                initialBackoff = 1.seconds,
+                maxBackoff = 8.seconds,
+                jitter = 0.0,
+            ),
+        )
+        client.connect()
+        runCurrent()
+        assertEquals(ConnectionState.Connected, client.connection.value)
+
+        // The next periodic heartbeat write fails.
+        transport.failNextSends = 1
+        advanceTimeBy(30_001L)
+        drainCurrent()
+        assertReconnectState(client.connection.value, attempt = 1)
+
+        advanceTimeBy(1_000L)
+        drainCurrent()
+        awaitConnected(client)
+        assertEquals(1, transport.reconnectAttemptTimes().size)
+
+        fun heartbeatCount() = transport.outboundFrames()
+            .mapNotNull(::decodeToRadioOrNull)
+            .count { it.heartbeat != null }
+        val before = heartbeatCount()
+        keepSessionAlive(transport, totalMs = 60_000L)
+        val sent = heartbeatCount() - before
+        assertTrue(sent in 1..2, "Expected one heartbeat per 30 s after reconnect, got $sent in 60 s")
+        assertEquals(ConnectionState.Connected, client.connection.value)
+    }
+
     @Test
     fun reconnectAfterSuccessStartsFreshBackoffCounter() = runTest {
         val transport = ScriptedTransport(
@@ -1213,6 +1258,9 @@ class HandshakeAndReconnectTest {
         private val inbound = MutableSharedFlow<Frame>(extraBufferCapacity = 128)
 
         var dropStage1OnNextHandshake: Boolean = false
+
+        /** When > 0, the next N [send] calls throw a transport error (e.g. BLE WriteRequestBusy). */
+        var failNextSends: Int = 0
         var dropStage2OnNextHandshake: Boolean = false
 
         override val state: StateFlow<TransportState> = stateFlow
@@ -1240,6 +1288,10 @@ class HandshakeAndReconnectTest {
         }
 
         override suspend fun send(frame: Frame) {
+            if (failNextSends > 0) {
+                failNextSends -= 1
+                throw MeshtasticException.Transport("Write failed: WriteRequestBusy")
+            }
             outboundFrames += frame
             val toRadio = decodeToRadio(frame) ?: return
             when (toRadio.want_config_id) {

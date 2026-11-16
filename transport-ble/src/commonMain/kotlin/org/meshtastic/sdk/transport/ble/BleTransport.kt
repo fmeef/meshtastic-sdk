@@ -28,8 +28,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.consumeAsFlow
-import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onCompletion
@@ -101,9 +100,13 @@ public class BleTransport(
     // next session when the transport is reused after disconnect.
     private var tuningScope: CoroutineScope? = null
 
-    // Recreated per connect cycle: a completed/cancelled collector leaves the previous
-    // channel unusable (consumeAsFlow cancels it), and reuse-after-disconnect needs a live one.
-    private var frameChannel = Channel<Frame>(capacity = 64)
+    // Recreated per connect cycle so frames from a stale cycle can't leak into the next one.
+    // Published through a StateFlow so a long-lived frames() collector (the engine collects
+    // once per client lifetime) follows the swap on reconnect instead of blocking forever on
+    // the previous cycle's channel. connect() closes the outgoing channel, which ends the
+    // collector's inner loop and moves it to the replacement.
+    private val frameChannelFlow = MutableStateFlow(Channel<Frame>(capacity = 64))
+    private val frameChannel: Channel<Frame> get() = frameChannelFlow.value
 
     // ADR-012: lifecycle idempotency — idempotent shutdown flag.
     private val shuttingDown = atomic(false)
@@ -138,11 +141,14 @@ public class BleTransport(
         warmupComplete.value = false
         lastDrainFailure.value = null
         errorPublished.value = false
-        // The previous session's collector cancelled its channel on completion; start each
-        // cycle with a fresh one. Safe unconditionally: drain/warmup senders for this cycle
-        // are launched later in connect(), and prior-cycle senders were cancelled by
-        // disconnect().
-        frameChannel = Channel(capacity = 64)
+        // Start each cycle with a fresh channel and close the previous one so an active
+        // frames() collector moves over (see [frameChannelFlow]). Safe unconditionally:
+        // drain/warmup senders for this cycle are launched later in connect(), and prior-cycle
+        // senders were cancelled by disconnect().
+        val cycleChannel = Channel<Frame>(capacity = 64)
+        val previousChannel = frameChannelFlow.value
+        frameChannelFlow.value = cycleChannel
+        previousChannel.close()
         _state.value = TransportState.Connecting
         try {
             connectWithRetry()
@@ -191,7 +197,7 @@ public class BleTransport(
                 withTimeout(BOND_WARMUP_TIMEOUT_MS) {
                     val payload = warmupRead()
                     if (payload != null && payload.isNotEmpty()) {
-                        frameChannel.send(Frame(prependFraming(payload)))
+                        cycleChannel.send(Frame(prependFraming(payload)))
                     }
                 }
             } catch (_: TimeoutCancellationException) {
@@ -204,7 +210,7 @@ public class BleTransport(
                 drain.run { payload ->
                     if (shuttingDown.value) return@run
                     try {
-                        frameChannel.send(Frame(prependFraming(payload)))
+                        cycleChannel.send(Frame(prependFraming(payload)))
                     } catch (e: kotlinx.coroutines.channels.ClosedSendChannelException) {
                         if (!shuttingDown.value) throw e
                     }
@@ -325,7 +331,7 @@ public class BleTransport(
             // (NRF52Bluetooth.cpp:213, NimBLE equivalent) — write-without-response is NOT
             // in the characteristic's properties and Android/Kable refuses the write
             // outright. Verified against real radios via MeshtasticBleConformanceTest.
-            peripheral.write(BleConstants.TORADIO, payload, WriteType.WithResponse)
+            writeWithBusyRetry(payload)
         } catch (e: NotConnectedException) {
             throw MeshtasticException.Transport(
                 "BLE write dropped — peripheral not connected: ${e.message}",
@@ -349,14 +355,45 @@ public class BleTransport(
         coordinator?.wake()
     }
 
-    /** Cold flow over received frames. Single-collection only. */
+    /**
+     * Acknowledged `toradio` write, retried when Android rejects it synchronously.
+     *
+     * `GattRequestRejectedException` (incl. Kable's `GattWriteException(WriteRequestBusy)`)
+     * means `BluetoothGatt` refused to queue the op — typically because a previous op on this
+     * client is still outstanding at the stack level. Nothing went on air, so a retry cannot
+     * duplicate the write. Status failures (`GattStatusException`) are not retried.
+     */
+    private suspend fun writeWithBusyRetry(payload: ByteArray) {
+        var attempt = 0
+        while (true) {
+            try {
+                peripheral.write(BleConstants.TORADIO, payload, WriteType.WithResponse)
+                return
+            } catch (e: GattRequestRejectedException) {
+                if (attempt >= WRITE_BUSY_BACKOFF_MS.size || shuttingDown.value) throw e
+                delay(WRITE_BUSY_BACKOFF_MS[attempt++])
+            }
+        }
+    }
+
+    /**
+     * Hot-ish flow over received frames, spanning reconnect cycles. Single-collection only.
+     *
+     * Each connect cycle gets its own channel; when [connect] replaces it the previous one is
+     * closed, the inner loop ends, and the collector moves to the replacement. Completes on
+     * [shutdown].
+     */
     override fun frames(): Flow<Frame> = flow {
         check(framesCollected.compareAndSet(expect = false, update = true)) {
             "BleTransport.frames() already has an active collector"
         }
-        // Resolve frameChannel at collection time (not call time) so a collector started
-        // after reconnect picks up the per-cycle replacement channel.
-        emitAll(frameChannel.consumeAsFlow())
+        var current: Channel<Frame>? = null
+        while (!shuttingDown.value) {
+            val prev = current
+            val ch = frameChannelFlow.first { it !== prev }
+            current = ch
+            for (frame in ch) emit(frame)
+        }
     }.onCompletion { framesCollected.value = false }
 
     /** Release internal coroutines and frame channel. Idempotent; does not close [Peripheral]. */
@@ -471,6 +508,9 @@ public class BleTransport(
 
         /** Total connect attempts (1 initial + N-1 retries) for transient GATT errors. */
         internal const val GATT_RETRY_ATTEMPTS: Int = 3
+
+        /** Backoff between retries of a synchronously-rejected (busy) `toradio` write. */
+        private val WRITE_BUSY_BACKOFF_MS: LongArray = longArrayOf(50L, 150L, 400L, 1_000L)
 
         /** GATT statuses indicating encryption/auth required (triggers bonding flow). */
         private fun isAuthRequiredStatus(status: Int): Boolean = status == 5 || status == 15 || status == 137

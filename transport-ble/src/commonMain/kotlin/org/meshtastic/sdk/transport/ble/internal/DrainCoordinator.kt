@@ -116,22 +116,22 @@ internal class DrainCoordinator(
 
     internal companion object {
         /**
-         * Default per-read timeout. 5 s comfortably exceeds a typical GATT read
-         * round-trip on Android/iOS even under congestion, but is short enough
-         * that a truly stuck read is surfaced within a single handshake attempt
-         * rather than blocking the drain forever.
+         * Default per-read timeout. Deliberately longer than Android's 30 s ATT transaction
+         * timeout, after which the stack tears the link down and the read fails on its own.
+         *
+         * A shorter deadline is unsafe on Android: cancelling a suspended Kable read releases
+         * Kable's GATT mutex while `BluetoothGatt` still has the read outstanding, so the next
+         * operation (typically a `toradio` write) is rejected with `WriteRequestBusy` and the
+         * late read response is consumed by an orphaned receiver. Observed in the field with a
+         * 5 s deadline when an ESP32 radio stalled a `fromradio` read for >5 s.
          */
-        const val DEFAULT_READ_TIMEOUT_MS: Long = 5_000L
+        const val DEFAULT_READ_TIMEOUT_MS: Long = 35_000L
 
         /**
-         * Default deadline applied to the very first read after [run] starts.
-         * Kept generous (30 s) because the post-connect drain races the
-         * platform's bonding/encryption warmup — on Android the first
-         * encrypted GATT read after pairing routinely takes 5–15 s while the
-         * stack reissues the request once the link is encrypted. After the
-         * first successful (or timed-out) read the loop drops to
-         * [DEFAULT_READ_TIMEOUT_MS]. Cross-ref: TX-11 in `audit-report.md`.
+         * Default deadline applied to the very first read after [run] starts. The post-connect
+         * drain races the platform's bonding/encryption warmup, where the first encrypted GATT
+         * read can take 5–15 s. Same as [DEFAULT_READ_TIMEOUT_MS] for the reason given there.
          */
-        const val DEFAULT_FIRST_READ_TIMEOUT_MS: Long = 30_000L
+        const val DEFAULT_FIRST_READ_TIMEOUT_MS: Long = 35_000L
     }
 }

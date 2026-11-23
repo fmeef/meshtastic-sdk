@@ -266,6 +266,13 @@ internal class MeshEngine(
     private val ackTimeoutJobs = mutableMapOf<MessageId, Job>()
 
     /**
+     * Wire ids of in-flight unicast sends with neither `want_ack` nor `want_response`. The
+     * firmware never sends a Routing ACK for these, so the accepting `QueueStatus` is the last
+     * feedback they get and resolves them. Touched only by the actor.
+     */
+    private val noAckUnicastSends = mutableSetOf<MessageId>()
+
+    /**
      * Stage 2 sliding-timeout watchdog. The engine no longer relies on a fixed Stage 2
      * deadline; instead, every frame received during [HandshakeStage.Stage2Draining] increments
      * [stage2ProgressCounter], and the watchdog checks every [STAGE2_PROGRESS_TICK_MS] whether
@@ -618,6 +625,7 @@ internal class MeshEngine(
         // cancel any in-flight per-send ACK timers so they don't post stale messages.
         for ((_, job) in ackTimeoutJobs) job.cancel()
         ackTimeoutJobs.clear()
+        noAckUnicastSends.clear()
         // cancel the Stage 2 sliding-timeout watchdog so it doesn't post stale timeouts.
         stage2WatchdogJob?.cancel()
         stage2WatchdogJob = null
@@ -1589,8 +1597,16 @@ internal class MeshEngine(
                 // namespaces collide at >= 32 (BAD_REQUEST = 32, NOT_AUTHORIZED = 33, …),
                 // so ERRNO values must never be decoded as Routing.Error.
                 if (queueStatus.res == 0 || queueStatus.res == ERRNO_SHOULD_RELEASE) {
-                    pendingSends[packetId]?.value = SendState.Sent
+                    if (noAckUnicastSends.remove(packetId)) {
+                        // No Routing ACK will follow for a no-ack unicast; the device taking
+                        // it is the final outcome (same contract as fire-and-forget broadcasts).
+                        ackTimeoutJobs.remove(packetId)?.cancel()
+                        pendingSends.remove(packetId)?.value = SendState.Acked
+                    } else {
+                        pendingSends[packetId]?.value = SendState.Sent
+                    }
                 } else {
+                    noAckUnicastSends.remove(packetId)
                     // The firmware rejected the packet at its transmit queue. Fast-fail
                     // the handle / pending RPC instead of letting the caller wait out the
                     // full ACK timer for a packet that never left the device.
@@ -2143,6 +2159,7 @@ internal class MeshEngine(
         handshakePacketBuffer.clear()
         for ((_, job) in ackTimeoutJobs) job.cancel()
         ackTimeoutJobs.clear()
+        noAckUnicastSends.clear()
         stage2WatchdogJob?.cancel()
         stage2WatchdogJob = null
         stage2ProgressCounter = 0L
@@ -2308,18 +2325,23 @@ internal class MeshEngine(
             return
         }
 
-        // Arm an ACK timeout for any send expecting firmware feedback:
+        val key = MessageId(wireId)
+        // Unicast without want_ack/want_response: no Routing ACK will ever arrive, so the
+        // device's accepting QueueStatus resolves it (see routeNormalEnvelope). Without this
+        // the handle sat in Sent forever and MessageHandle.await() never returned.
+        if (!packet.want_ack && !wantsResponse) noAckUnicastSends += key
+
+        // Arm an ACK timeout for every send still awaiting feedback, so a lost Routing ACK or
+        // QueueStatus fails the handle instead of leaving await() suspended:
         //  • unicast want_ack — waits for recipient's Routing ACK
         //  • broadcast want_ack — waits for firmware's implicit ACK (relay overheard)
         //  • want_response requests (e.g. AdminMessage.get_owner_request)
-        if (packet.want_ack || wantsResponse) {
-            val key = MessageId(wireId)
-            val scope = engineScope ?: return
-            ackTimeoutJobs.remove(key)?.cancel()
-            ackTimeoutJobs[key] = scope.launch {
-                delay(sendTimeout)
-                inbox.trySend(EngineMessage.SendAckTimeout(key))
-            }
+        //  • no-ack unicast — waits for the device's QueueStatus
+        val scope = engineScope ?: return
+        ackTimeoutJobs.remove(key)?.cancel()
+        ackTimeoutJobs[key] = scope.launch {
+            delay(sendTimeout)
+            inbox.trySend(EngineMessage.SendAckTimeout(key))
         }
     }
 
@@ -2332,6 +2354,7 @@ internal class MeshEngine(
         // regardless of state, drop any pending ACK timer so we don't post a stale
         // SendAckTimeout for a handle the user has explicitly cancelled.
         ackTimeoutJobs.remove(msg.id)?.cancel()
+        noAckUnicastSends.remove(msg.id)
     }
 
     private fun handleHeartbeatTick() {
@@ -2653,6 +2676,7 @@ internal class MeshEngine(
     // (only if it's still in a non-terminal state — a late ACK that won the race takes
     // precedence) and prune our bookkeeping.
     private fun handleSendAckTimeout(msg: EngineMessage.SendAckTimeout) {
+        noAckUnicastSends.remove(msg.id)
         val flow = pendingSends[msg.id] ?: return
         ackTimeoutJobs.remove(msg.id)
         when (flow.value) {

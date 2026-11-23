@@ -12,6 +12,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import okio.ByteString
@@ -37,6 +38,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * Behaviour added for the Meshtastic-Android hard cutover (0.2.0): typed auxiliary-frame
@@ -84,6 +86,56 @@ class AndroidCutoverPrereqsTest {
             assertEquals(SendFailure.QueueRejected(res = 9), state.reason)
         }
     }
+
+    @Test
+    fun noAckUnicastResolvesOnAcceptingQueueStatus() = runTest {
+        withConnectedClient { client, transport ->
+            val handle = client.send(noAckUnicast())
+            runCurrent()
+            assertEquals(SendState.Sent, handle.state.value)
+
+            transport.injectFrame(
+                frameOf(
+                    FromRadio.Builder().also { wb ->
+                        wb.queueStatus = QueueStatus.Builder().also { wb ->
+                            wb.res = 0
+                            wb.mesh_packet_id = handle.id.raw
+                        }.build()
+                    }.build(),
+                ),
+            )
+            runCurrent()
+
+            // No Routing ACK is ever sent for a want_ack=false unicast; without this the
+            // handle stayed in Sent and await() never returned.
+            assertEquals(SendState.Acked, handle.state.value)
+            assertEquals(SendOutcome.Success, handle.await())
+        }
+    }
+
+    @Test
+    fun noAckUnicastWithoutQueueStatusTimesOut() = runTest {
+        withConnectedClient { client, _ ->
+            val handle = client.send(noAckUnicast())
+            runCurrent()
+            assertEquals(SendState.Sent, handle.state.value)
+
+            advanceTimeBy(31.seconds)
+            runCurrent()
+
+            val state = assertIs<SendState.Failed>(handle.state.value)
+            assertEquals(SendFailure.AckTimeout, state.reason)
+        }
+    }
+
+    private fun noAckUnicast(): MeshPacket = MeshPacket.Builder().also { wb ->
+        wb.to = REMOTE_NODE.raw
+        wb.want_ack = false
+        wb.decoded = org.meshtastic.proto.Data.Builder().also { wb ->
+            wb.portnum = org.meshtastic.proto.PortNum.PRIVATE_APP
+            wb.payload = byteArrayOf(1, 2, 3).toByteString()
+        }.build()
+    }.build()
 
     @Test
     fun auxiliaryFramesSurfaceAsTypedEvents() = runTest {
